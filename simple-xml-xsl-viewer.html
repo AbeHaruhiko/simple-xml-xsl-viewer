@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <title>XML/XSL Viewer (Fixed)</title>
+    <style>
+        body { font-family: sans-serif; margin: 0; display: flex; flex-direction: column; height: 100vh; background: #f0f2f5; }
+        
+        #drop-zone {
+            height: 120px; border: 3px dashed #bbb; margin: 20px; border-radius: 12px;
+            display: flex; flex-direction: column; align-items: center; justify-content: center;
+            background: white; color: #555; transition: 0.3s; text-align: center;
+        }
+        #drop-zone.dragover { background: #e3f2fd; border-color: #2196f3; }
+        
+        #toolbar { margin: 0 20px 10px; display: flex; align-items: center; gap: 15px; }
+        #status { flex: 1; padding: 10px; border-radius: 4px; font-size: 0.9em; background: #eee; min-height: 1.2em; }
+        .info { background: #e8f5e9; color: #2e7d32; border-left: 5px solid #2e7d32; }
+        .error { background: #ffebee; color: #c62828; border-left: 5px solid #c62828; }
+
+        .btn {
+            padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; 
+            font-weight: bold; white-space: nowrap;
+        }
+        .print-btn { background: #4caf50; color: white; display: none; }
+        .file-btn { background: #2196f3; color: white; }
+
+        #viewer-container { 
+            flex: 1; margin: 0 20px 20px; background: white; 
+            border: 1px solid #ddd; overflow: auto; padding: 40px; 
+            box-shadow: 0 2px 10px rgba(0,0,0,0.05);
+        }
+
+        @media print {
+            #drop-zone, #toolbar, .btn, #status { display: none !important; }
+            body { background: white; }
+            #viewer-container { border: none; padding: 0; overflow: visible; }
+        }
+    </style>
+</head>
+<body>
+
+    <div id="drop-zone">
+        <strong>ここにXMLとXSLを「一緒に」ドロップしてください</strong>
+        <p style="font-size: 0.8em; color: #888;">または下のボタンから複数選択してください</p>
+    </div>
+
+    <div id="toolbar">
+        <input type="file" id="fileInput" multiple accept=".xml,.xsl,.xslt" style="display:none">
+        <button class="btn file-btn" onclick="document.getElementById('fileInput').click()">ファイルを選択</button>
+        <div id="status">準備完了。</div>
+        <button id="printBtn" class="btn print-btn" onclick="window.print()">印刷</button>
+    </div>
+
+    <div id="viewer-container">
+        <div id="output"></div>
+    </div>
+
+    <script>
+        const dropZone = document.getElementById('drop-zone');
+        const fileInput = document.getElementById('fileInput');
+        const output = document.getElementById('output');
+        const statusDiv = document.getElementById('status');
+        const printBtn = document.getElementById('printBtn');
+
+        // ファイル処理のメイン関数
+        async function processFiles(files) {
+            const fileList = Array.from(files);
+            const xmlFile = fileList.find(f => f.name.toLowerCase().endsWith('.xml'));
+            
+            if (!xmlFile) {
+                showMessage("XMLファイルが見つかりません。", "error");
+                return;
+            }
+
+            try {
+                const xmlText = await xmlFile.text();
+                const parser = new DOMParser();
+                const xmlDoc = parser.parseFromString(xmlText, "text/xml");
+
+                // 1. XMLから XSLの名前を取得
+                const xslHref = extractXslHref(xmlDoc);
+                if (!xslHref) {
+                    showMessage("XML内に &lt;?xml-stylesheet?&gt; タグが見つかりません。", "error");
+                    return;
+                }
+
+                // 2. ドロップされたファイルの中からXSLを探す（名前が一致するか確認）
+                // パスが含まれている場合に備えてファイル名のみで比較
+                const targetXslName = xslHref.split('/').pop().toLowerCase();
+                const matchedXslFile = fileList.find(f => f.name.toLowerCase() === targetXslName);
+
+                let xslDoc;
+                if (matchedXslFile) {
+                    const xslText = await matchedXslFile.text();
+                    xslDoc = parser.parseFromString(xslText, "text/xml");
+                    showMessage(`表示中: ${xmlFile.name} (スタイル: ${matchedXslFile.name})`, "info");
+                } else {
+                    // ドロップにない場合のみfetchを試みる（サーバー上なら動く）
+                    try {
+                        const response = await fetch(xslHref);
+                        if (!response.ok) throw new Error();
+                        const xslText = await response.text();
+                        xslDoc = parser.parseFromString(xslText, "text/xml");
+                        showMessage(`表示中: ${xmlFile.name} (外部参照: ${xslHref})`, "info");
+                    } catch (e) {
+                        showMessage(`スタイルシート "${xslHref}" が読み込めません。<br><strong>${xslHref}</strong> も一緒に選択（ドロップ）してください。`, "error");
+                        return;
+                    }
+                }
+
+                // 3. 変換実行
+                const xsltProcessor = new XSLTProcessor();
+                xsltProcessor.importStylesheet(xslDoc);
+                const resultFragment = xsltProcessor.transformToFragment(xmlDoc, document);
+
+                if (resultFragment) {
+                    output.innerHTML = "";
+                    output.appendChild(resultFragment);
+                    printBtn.style.display = "block";
+                }
+
+            } catch (err) {
+                showMessage("エラー: " + err.message, "error");
+            }
+        }
+
+        // --- イベントリスナー ---
+        dropZone.ondragover = (e) => { e.preventDefault(); dropZone.classList.add('dragover'); };
+        dropZone.ondragleave = () => dropZone.classList.remove('dragover');
+        dropZone.ondrop = (e) => {
+            e.preventDefault();
+            dropZone.classList.remove('dragover');
+            processFiles(e.dataTransfer.files);
+        };
+        fileInput.onchange = (e) => processFiles(e.target.files);
+
+        function extractXslHref(xmlDoc) {
+            let n = xmlDoc.firstChild;
+            while (n) {
+                if (n.nodeType === Node.PROCESSING_INSTRUCTION_NODE && n.target === 'xml-stylesheet') {
+                    const match = n.data.match(/href=["']([^"']+)["']/);
+                    if (match) return match[1];
+                }
+                n = n.nextSibling;
+            }
+            return null;
+        }
+
+        function showMessage(msg, type) {
+            statusDiv.innerHTML = msg;
+            statusDiv.className = type;
+            if (type === 'error') {
+                printBtn.style.display = "none";
+                output.innerHTML = "";
+            }
+        }
+    </script>
+</body>
+</html>
